@@ -1,0 +1,201 @@
+# Illustrative example, not a runnable pipeline.
+# Location in the Android SDK repository: .github/workflows/release-candidate.yml
+#
+# Stage 3 of the CI flow: validation of a release candidate before the final version is published.
+# The candidate (for example 3.5.0-rc.1) is published as a pre-release version to the internal
+# Maven repository, so consuming applications resolve it like any other release.
+
+name: Release candidate checks
+
+on:
+  push:
+    tags: ["v*-rc.*"]
+
+jobs:
+  preconditions:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      # A release candidate cannot be cut from a red commit.
+      - name: The tagged commit passed the main branch checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh run list --workflow main-checks.yml --commit "$GITHUB_SHA" --status success --limit 1 \
+            --json databaseId --jq 'length' | grep -qx 1
+
+  publish-rc:
+    needs: preconditions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Derive the version from the tag
+        id: version
+        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Publish the release candidate to the internal Maven repository
+        run: ./gradlew publish -PsdkVersion=${{ steps.version.outputs.value }}
+        env:
+          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+
+  api-compatibility:
+    needs: preconditions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history and tags, needed to find the baseline
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Find the last released version
+        run: echo "BASELINE=$(git describe --tags --abbrev=0 --exclude '*-rc.*')" >> "$GITHUB_ENV"
+      # Kotlin Binary Compatibility Validator: the committed .api dump must match the code.
+      - name: The public API dump is up to date
+        run: ./gradlew apiCheck
+      - name: No public declaration removed or changed since the last release
+        run: |
+          major() { echo "${1#v}" | cut -d. -f1; }
+          # Removed lines in the .api dump are breaking changes: accepted only with a major version bump.
+          if git diff "$BASELINE" -- '*.api' | grep -E '^-[^-]'; then
+            [ "$(major "$GITHUB_REF_NAME")" -gt "$(major "$BASELINE")" ]
+          fi
+
+  regression:
+    name: ${{ matrix.suite }}
+    needs: publish-rc
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # regression: full UI/E2E suite on the Demo app with a stubbed backend.
+        # backend-integration: a limited set against the real backend test environment.
+        # upgrade-paths: data written by the previous SDK version is read by this one.
+        suite: [regression, backend-integration, upgrade-paths]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Enable KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run the ${{ matrix.suite }} suite on the Demo app built against the release candidate
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          script: ./gradlew :demo-app:connectedDebugAndroidTest -PsdkVersion=${{ needs.publish-rc.outputs.version }} -Psuite=${{ matrix.suite }}
+      - name: Upload reports, logcat and screenshots
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.suite }}-outputs
+          path: demo-app/build/outputs/
+
+  device-os-matrix:
+    name: API ${{ matrix.api-level }} (${{ matrix.profile }})
+    needs: publish-rc
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false   # show every failing configuration, not only the first
+      matrix:
+        # Risk-based: extend with the most-used OS versions and with real devices
+        # from a device farm for hardware-dependent modules.
+        include:
+          - { api-level: 26, profile: pixel_2 }        # minimum supported OS
+          - { api-level: 35, profile: pixel_7 }        # latest OS
+          - { api-level: 35, profile: pixel_tablet }   # tablet class
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Enable KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Integration tests on this configuration
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          profile: ${{ matrix.profile }}
+          arch: x86_64
+          script: ./gradlew :integration-tests:connectedDebugAndroidTest
+      - name: Upload reports and logcat
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-${{ matrix.api-level }}-${{ matrix.profile }}-outputs
+          path: integration-tests/build/outputs/
+
+  consumer-smoke:
+    name: consumer ${{ matrix.app }}
+    needs: publish-rc
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [new-app-android, consumer-app-android]
+    steps:
+      - name: Check out the consuming application
+        uses: actions/checkout@v4
+        with:
+          repository: example-org/${{ matrix.app }}
+          token: ${{ secrets.CONSUMER_REPOS_TOKEN }}
+      # Each application owns this script: it builds the app against the given SDK version
+      # and runs the application's own smoke suite.
+      - name: Build and smoke-test against the release candidate
+        run: ./ci/sdk-smoke.sh "${{ needs.publish-rc.outputs.version }}"
+
+  release-gate:
+    needs: [api-compatibility, regression, device-os-matrix, consumer-smoke]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      # The full report also lists public API changes and the currently quarantined tests.
+      - name: Write the release report
+        run: |
+          {
+            echo "## Android SDK release candidate $GITHUB_REF_NAME"
+            echo "| Gate | Result |"
+            echo "| --- | --- |"
+            echo "| Public API compatibility | ${{ needs.api-compatibility.result }} |"
+            echo "| Regression, real backend, upgrade paths | ${{ needs.regression.result }} |"
+            echo "| Device/OS matrix | ${{ needs.device-os-matrix.result }} |"
+            echo "| Consumer application smoke | ${{ needs.consumer-smoke.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Share the result with the SDK and consuming application teams
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            text: "Android SDK ${{ github.ref_name }} release report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      - name: Block the release if any gate did not pass
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1
+
+  publish:
+    needs: release-gate
+    runs-on: ubuntu-latest
+    environment: sdk-release   # required reviewers on this environment give the manual go/no-go
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish the final version and the release notes
+        run: ./scripts/promote-release.sh "$GITHUB_REF_NAME"

@@ -1,0 +1,165 @@
+# Illustrative example, not a runnable pipeline.
+# Location in the iOS SDK repository: .github/workflows/release-candidate.yml
+#
+# Stage 3 of the CI flow: validation of a release candidate before the final version is published.
+# The tag (for example v3.5.0-rc.1) is itself the pre-release version
+# that Swift Package Manager resolves in consuming applications.
+
+name: Release candidate checks
+
+on:
+  push:
+    tags: ["v*-rc.*"]
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer   # pinned toolchain
+  SCHEME: MySDK
+
+jobs:
+  preconditions:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      # A release candidate cannot be cut from a red commit.
+      - name: The tagged commit passed the main branch checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh run list --workflow main-checks.yml --commit "$GITHUB_SHA" --status success --limit 1 \
+            --json databaseId --jq 'length' | grep -qx 1
+
+  api-compatibility:
+    needs: preconditions
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history and tags, needed to find the baseline
+      - name: Find the last released version
+        run: echo "BASELINE=$(git describe --tags --abbrev=0 --exclude '*-rc.*')" >> "$GITHUB_ENV"
+      - name: Public API diff against the last release
+        run: |
+          major() { echo "${1#v}" | cut -d. -f1; }
+          if [ "$(major "$GITHUB_REF_NAME")" -gt "$(major "$BASELINE")" ]; then
+            echo "Major version bump: breaking changes are allowed and must be covered by migration notes."
+          else
+            swift package diagnose-api-breaking-changes "$BASELINE"
+          fi
+
+  regression:
+    name: ${{ matrix.suite }}
+    needs: preconditions
+    runs-on: macos-15
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # Regression: full UI/E2E suite on the Demo app with a stubbed backend.
+        # BackendIntegration: a limited set against the real backend test environment.
+        # UpgradePaths: data written by the previous SDK version is read by this one.
+        suite: [Regression, BackendIntegration, UpgradePaths]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ${{ matrix.suite }}
+        run: |
+          xcodebuild test -project DemoApp/DemoApp.xcodeproj -scheme DemoApp \
+            -testPlan "${{ matrix.suite }}" \
+            -destination "platform=iOS Simulator,name=iPhone 16,OS=18.5" \
+            -retry-tests-on-failure -test-iterations 2 \
+            -resultBundlePath "results/${{ matrix.suite }}.xcresult"
+      - name: Upload the result bundle
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.suite }}-xcresult
+          path: results/
+
+  device-os-matrix:
+    name: ${{ matrix.device }} (iOS ${{ matrix.os }})
+    needs: preconditions
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_${{ matrix.xcode }}.app/Contents/Developer
+    strategy:
+      fail-fast: false   # show every failing configuration, not only the first
+      matrix:
+        # Risk-based: extend with the most-used OS versions and with real devices
+        # from a device farm for hardware-dependent modules.
+        include:
+          - { runner: macos-14, xcode: "15.4", device: "iPhone 15", os: "17.5" }               # minimum supported OS
+          - { runner: macos-15, xcode: "16.4", device: "iPhone 16", os: "18.5" }               # latest OS
+          - { runner: macos-15, xcode: "16.4", device: "iPad (10th generation)", os: "18.5" }  # tablet class
+    steps:
+      - uses: actions/checkout@v4
+      - name: Integration tests on this configuration
+        run: |
+          xcodebuild test -scheme "$SCHEME" -testPlan Integration \
+            -destination "platform=iOS Simulator,name=${{ matrix.device }},OS=${{ matrix.os }}" \
+            -resultBundlePath results/Matrix.xcresult
+      - name: Upload the result bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-${{ matrix.os }}-${{ strategy.job-index }}-xcresult
+          path: results/
+
+  consumer-smoke:
+    name: consumer ${{ matrix.app }}
+    needs: preconditions
+    runs-on: macos-15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [new-app-ios, consumer-app-ios]
+    steps:
+      - name: Check out the consuming application
+        uses: actions/checkout@v4
+        with:
+          repository: example-org/${{ matrix.app }}
+          token: ${{ secrets.CONSUMER_REPOS_TOKEN }}
+      # Each application owns this script: it builds the app against the given SDK version
+      # and runs the application's own smoke suite.
+      - name: Build and smoke-test against the release candidate
+        run: ./ci/sdk-smoke.sh "${GITHUB_REF_NAME#v}"
+
+  release-gate:
+    needs: [api-compatibility, regression, device-os-matrix, consumer-smoke]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      # The full report also lists public API changes and the currently quarantined tests.
+      - name: Write the release report
+        run: |
+          {
+            echo "## iOS SDK release candidate $GITHUB_REF_NAME"
+            echo "| Gate | Result |"
+            echo "| --- | --- |"
+            echo "| Public API compatibility | ${{ needs.api-compatibility.result }} |"
+            echo "| Regression, real backend, upgrade paths | ${{ needs.regression.result }} |"
+            echo "| Device/OS matrix | ${{ needs.device-os-matrix.result }} |"
+            echo "| Consumer application smoke | ${{ needs.consumer-smoke.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Share the result with the SDK and consuming application teams
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            text: "iOS SDK ${{ github.ref_name }} release report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      - name: Block the release if any gate did not pass
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1
+
+  publish:
+    needs: release-gate
+    runs-on: ubuntu-latest
+    environment: sdk-release   # required reviewers on this environment give the manual go/no-go
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag the final version and publish the release notes
+        run: ./scripts/promote-release.sh "$GITHUB_REF_NAME"

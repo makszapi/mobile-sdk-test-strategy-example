@@ -1,0 +1,112 @@
+# Illustrative example, not a runnable pipeline.
+# Location in the Android SDK repository: .github/workflows/main-checks.yml
+#
+# Stage 2 of the CI flow: broader checks after every merge and nightly.
+# These suites are too slow for the pull-request path. A failure here stops the line.
+
+name: Main branch checks
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 2 * * *"   # nightly
+  workflow_dispatch:
+
+jobs:
+  integration-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Full integration tests (real modules together, stubbed backend)
+        run: ./gradlew :integration-tests:testDebugUnitTest
+      - name: Upload the test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-reports
+          path: "**/build/reports/tests/"
+
+  demo-app-tests:
+    name: demo-app ${{ matrix.suite }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: ${{ matrix.quarantined == true }}   # quarantined tests still run and report, but do not block
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: smoke          # build, SDK initialization, one call per module
+          - suite: critical-e2e   # critical UI/E2E journeys with a stubbed backend
+          - suite: quarantine     # each test has an owner, a ticket and an expiry date
+            quarantined: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+
+      # Consume the SDK the way an application does: as a published artifact, not as a project dependency.
+      - name: Publish the SDK to the local Maven repository
+        run: ./gradlew publishToMavenLocal -PsdkVersion=0.0.0-main
+
+      - name: Enable KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # UI tests get at most one retry, and only for failed tests (configured in the test runner).
+      - name: Run the ${{ matrix.suite }} suite on the Demo app
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          script: ./gradlew :demo-app:connectedDebugAndroidTest -PsdkVersion=0.0.0-main -Psuite=${{ matrix.suite }}
+
+      # A test that passed only on retry is reported as flaky, not as green.
+      - name: Report tests that passed only on retry
+        if: ${{ !cancelled() }}
+        run: ./scripts/report-flaky.sh demo-app/build/outputs/androidTest-results >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reports, logcat and screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-app-${{ matrix.suite }}-outputs
+          path: demo-app/build/outputs/
+
+  notify:
+    needs: [integration-tests, demo-app-tests]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      # In practice the message also names the owning module team,
+      # resolved from CODEOWNERS for the failing test module.
+      - name: Post to the team channel
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            text: "Android SDK main is red at ${{ github.sha }}. Failed run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      # One tracked issue per failure instead of repeated alerts.
+      - name: Open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          existing=$(gh issue list --label main-broken --state open --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Still failing: $RUN_URL"
+          else
+            gh issue create --label main-broken --title "main is red at ${GITHUB_SHA::7}" --body "$RUN_URL"
+          fi

@@ -1,0 +1,85 @@
+# Illustrative example, not a runnable pipeline.
+# Location in the Android SDK repository: .github/workflows/pr-checks.yml
+#
+# Stage 1 of the CI flow: fast, deterministic checks that gate every merge.
+# All jobs are required status checks (configured in branch protection).
+
+name: PR checks
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true   # a newer push supersedes the running check
+
+permissions:
+  contents: read
+  checks: write   # test report published as a check on the pull request
+
+jobs:
+  static-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4   # also restores the Gradle cache
+      - name: detekt and Android Lint
+        run: ./gradlew detekt lintDebug
+
+  tests:
+    name: ${{ matrix.suite }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15   # time budget; slower suites belong in main-checks.yml
+    strategy:
+      fail-fast: false    # report every failing suite, not only the first
+      matrix:
+        include:
+          - suite: unit-tests
+            task: testDebugUnitTest
+          - suite: contract-tests
+            task: :contract-tests:test
+          # The selected integration subset runs on the JVM; device tests run on main.
+          # When it outgrows the time budget, select tests by changed modules instead.
+          - suite: integration-smoke
+            task: :integration-tests:testDebugUnitTest -Psuite=smoke
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the shared contract specification (pinned version)
+        if: matrix.suite == 'contract-tests'
+        uses: actions/checkout@v4
+        with:
+          repository: example-org/sdk-contract-specs
+          ref: ${{ vars.CONTRACT_SPEC_VERSION }}
+          token: ${{ secrets.CONTRACT_SPECS_TOKEN }}
+          path: contract-specs
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+
+      # No retries at this stage: these tests must be deterministic.
+      - name: Run ${{ matrix.suite }}
+        run: ./gradlew ${{ matrix.task }}
+
+      - name: Every scenario in the contract specification has a test
+        if: matrix.suite == 'contract-tests'
+        run: ./scripts/check-contract-coverage.sh contract-specs/scenarios contract-tests/build/test-results
+
+      - name: Publish failing tests on the pull request
+        if: ${{ !cancelled() }}
+        uses: mikepenz/action-junit-report@v5
+        with:
+          check_name: ${{ matrix.suite }} report
+          report_paths: "**/build/test-results/**/*.xml"
+
+      - name: Upload the test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.suite }}-reports
+          path: "**/build/reports/tests/"

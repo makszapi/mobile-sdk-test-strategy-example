@@ -1,0 +1,124 @@
+# Illustrative example, not a runnable pipeline.
+# Location in the iOS SDK repository: .github/workflows/main-checks.yml
+#
+# Stage 2 of the CI flow: broader checks after every merge and nightly.
+# These suites are too slow for the pull-request path. A failure here stops the line.
+
+name: Main branch checks
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 2 * * *"   # nightly
+  workflow_dispatch:
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer   # pinned toolchain
+  SCHEME: MySDK
+  DESTINATION: platform=iOS Simulator,name=iPhone 16,OS=18.5
+
+jobs:
+  integration-tests:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Full integration tests (real modules together, stubbed backend)
+        run: |
+          xcodebuild test -scheme "$SCHEME" -testPlan Integration \
+            -destination "$DESTINATION" \
+            -resultBundlePath results/Integration.xcresult
+      - name: Upload the result bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-xcresult
+          path: results/
+
+  demo-app-smoke:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # Consume the SDK the way an application does: as a packaged artifact, not as source.
+      - name: Package the SDK as an XCFramework
+        run: ./scripts/build-xcframework.sh --output build/MySDK.xcframework
+      - name: Build the Demo app against the packaged SDK and run smoke tests
+        run: |
+          xcodebuild test -project DemoApp/DemoApp.xcodeproj -scheme DemoApp -testPlan Smoke \
+            -destination "$DESTINATION" \
+            -resultBundlePath results/DemoSmoke.xcresult
+      - name: Upload the result bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-smoke-xcresult
+          path: results/
+
+  critical-ui-tests:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # At most one retry, and only for failed tests.
+      - name: Critical UI/E2E tests on the Demo app (stubbed backend)
+        run: |
+          xcodebuild test -project DemoApp/DemoApp.xcodeproj -scheme DemoApp -testPlan CriticalE2E \
+            -destination "$DESTINATION" \
+            -retry-tests-on-failure -test-iterations 2 \
+            -resultBundlePath results/CriticalE2E.xcresult
+      # A test that passed only on retry is reported as flaky, not as green.
+      - name: Report tests that passed only on retry
+        if: ${{ !cancelled() }}
+        run: ./scripts/report-flaky.sh results/CriticalE2E.xcresult >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the result bundle with screenshots and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: critical-e2e-xcresult
+          path: results/
+
+  quarantined-tests:
+    runs-on: macos-15
+    timeout-minutes: 30
+    continue-on-error: true   # quarantined tests still run and report, but do not block
+    steps:
+      - uses: actions/checkout@v4
+      # Each test in this plan has an owner, a ticket and an expiry date.
+      - name: Quarantined tests
+        run: |
+          xcodebuild test -scheme "$SCHEME" -testPlan Quarantine \
+            -destination "$DESTINATION" \
+            -resultBundlePath results/Quarantine.xcresult
+
+  notify:
+    needs: [integration-tests, demo-app-smoke, critical-ui-tests]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      # In practice the message also names the owning module team,
+      # resolved from CODEOWNERS for the failing test target.
+      - name: Post to the team channel
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            text: "iOS SDK main is red at ${{ github.sha }}. Failed run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      # One tracked issue per failure instead of repeated alerts.
+      - name: Open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          existing=$(gh issue list --label main-broken --state open --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Still failing: $RUN_URL"
+          else
+            gh issue create --label main-broken --title "main is red at ${GITHUB_SHA::7}" --body "$RUN_URL"
+          fi

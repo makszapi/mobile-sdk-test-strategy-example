@@ -1,0 +1,84 @@
+# Illustrative example, not a runnable pipeline.
+# Location in the iOS SDK repository: .github/workflows/pr-checks.yml
+#
+# Stage 1 of the CI flow: fast, deterministic checks that gate every merge.
+# All jobs are required status checks (configured in branch protection).
+
+name: PR checks
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true   # a newer push supersedes the running check
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer   # pinned toolchain
+  SCHEME: MySDK
+  DESTINATION: platform=iOS Simulator,name=iPhone 16,OS=18.5
+
+jobs:
+  static-analysis:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: SwiftLint
+        run: swiftlint lint --strict --reporter github-actions-logging
+
+  tests:
+    name: ${{ matrix.suite }}
+    runs-on: macos-15
+    timeout-minutes: 15   # time budget; slower suites belong in main-checks.yml
+    strategy:
+      fail-fast: false    # report every failing suite, not only the first
+      matrix:
+        # One Xcode test plan per suite. IntegrationSmoke is the selected integration subset;
+        # when it outgrows the time budget, select tests by changed modules instead.
+        suite: [UnitTests, ContractTests, IntegrationSmoke]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the shared contract specification (pinned version)
+        if: matrix.suite == 'ContractTests'
+        uses: actions/checkout@v4
+        with:
+          repository: example-org/sdk-contract-specs
+          ref: ${{ vars.CONTRACT_SPEC_VERSION }}
+          token: ${{ secrets.CONTRACT_SPECS_TOKEN }}
+          path: contract-specs
+
+      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Developer/Xcode/DerivedData/**/SourcePackages/checkouts
+          key: spm-${{ hashFiles('**/Package.resolved') }}
+
+      # No retries at this stage: these tests must be deterministic.
+      - name: Run ${{ matrix.suite }}
+        run: |
+          xcodebuild test \
+            -scheme "$SCHEME" \
+            -testPlan "${{ matrix.suite }}" \
+            -destination "$DESTINATION" \
+            -resultBundlePath "results/${{ matrix.suite }}.xcresult"
+
+      - name: Every scenario in the contract specification has a test
+        if: matrix.suite == 'ContractTests'
+        run: ./scripts/check-contract-coverage.sh contract-specs/scenarios results/ContractTests.xcresult
+
+      - name: List failing tests in the pull request summary
+        if: failure()
+        run: |
+          xcrun xcresulttool get test-results summary --path "results/${{ matrix.suite }}.xcresult" \
+            | jq -r '.testFailures[] | "- \(.targetName) / \(.testName): \(.failureText)"' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the result bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.suite }}-xcresult
+          path: results/
