@@ -6,7 +6,7 @@ A quality-engineering approach for an internal mobile SDK used by multiple iOS a
 
 | Path | Content |
 | --- | --- |
-| [`docs/Assignment_scafold.md`](./docs/Test_Strategy_And_Assignment_Exercises.md) | The main document with all six sections, including the compatibility approach and key assumptions |
+| [`docs/Test_Strategy_And_Assignment_Exercises.md`](./docs/Test_Strategy_And_Assignment_Exercises.md) | The main document with all six sections, including the compatibility approach and key assumptions |
 | [`docs/Checks_within_CI_flow.png`](./docs/Checks_within_CI_flow.png) | CI flow diagram used in the document |
 | [`test-examples/`](./test-examples/) | Automation example: contract tests for networking and error handling on iOS (XCTest) and Android (JUnit), with its own [README](./test-examples/README.md) |
 | [`workflow-examples/`](./workflow-examples/) | Example GitHub Actions workflows for the separate iOS and Android SDK repositories, with its own [README](./workflow-examples/README.md) |
